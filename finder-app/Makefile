@@ -1,11 +1,11 @@
 .PHONY: clean
 
-COMPILER = $(CROSS_COMPILE)gcc
+CC ?= gcc
 
 all: writer
 
 writer: writer.c
-	$(COMPILER) writer.c -o writer
+	$(CC) writer.c -o writer
 
 clean:
 	rm -f ./writer ./*.o
