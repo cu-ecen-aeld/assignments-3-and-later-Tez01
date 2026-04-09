@@ -49,7 +49,7 @@ then
 	fi
 fi
 
-echo "Removing the old writer utility and compiling as a native application"
+#echo "Removing the old writer utility and compiling as a native application"
 #make clean
 #make
 
