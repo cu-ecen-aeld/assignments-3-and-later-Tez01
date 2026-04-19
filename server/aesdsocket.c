@@ -21,15 +21,18 @@
 
 #include <stdio.h>
 
+#include <sys/stat.h>
+
 #define SIZE_OF_RAM_BUFFER	1000
 
 static int socket_fd = 0;
 static int client_fd = 0;
 static int normal_fd = 0;
 
+void daemonize(void);
 
 static void write_to_file(char *buf, size_t num_bytes_to_write);
-static void send_file_data_to_client(size_t num_bytes_to_send);
+static void send_file_data_to_client(void);
 
 static void signal_handler(int signo);
 static void setup_signal_handlers(void);
@@ -39,7 +42,8 @@ static void clean_up(void);
 
 static char output_filename[] = "/var/tmp/aesdsocketdata";
 
-int main(){
+int main(int argc, char *argv[]){
+
 	socket_fd = -1;
 	client_fd = -1;
 	normal_fd = -1;
@@ -57,7 +61,7 @@ int main(){
 		error_handler("Could not create socket: %s", errno);
 	}
 
-	int opt = 1;	// MUST: Remove
+	int opt = 1;	
 	setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
 	// bind socket
@@ -82,10 +86,18 @@ int main(){
 	
 	free(servinfo);	// no use of servinfo now, free
 
+	if(argc == 2){
+		if(strcmp(argv[1], "-d") == 0){
+			daemonize();
+		}
+	}
+	
 	// Listen for new connections
 	if((status = listen(socket_fd, 5) != 0)){
 		error_handler("Could not listen: %s", errno);
 	}
+
+	
 
 	while(1){
 		// Accept new connection
@@ -115,11 +127,11 @@ int main(){
 			num_bytes_rcvd = recv(client_fd, buffer, sizeof(buffer), 0);
 
 			if(num_bytes_rcvd == 0){
-				// MUST: Close socket and file wherever error occuring???
 				if(close(client_fd) == -1){
 					error_handler("Close failed: %s", errno);
 				}
-
+				client_fd = -1;	// Make client fd invalid again
+				
 				syslog(LOG_DEBUG, "Closed connection from %s", ip);
 				break;
 			}
@@ -130,10 +142,14 @@ int main(){
 			}
 			
 			// Received some bytes
-			for (ssize_t i = 0; i < num_bytes_rcvd; i++) {// MUST: Remove
-				syslog(LOG_DEBUG, "buffer[%zd] = %d", i, (unsigned char)buffer[i]);
-			}	
-
+			
+			
+			//---------Test Code------------
+//			for (ssize_t i = 0; i < num_bytes_rcvd; i++) {
+//				syslog(LOG_DEBUG, "buffer[%zd] = %d", i, (unsigned char)buffer[i]);
+//			}	
+			//---------Test Code------------
+			
 			total_bytes_rcvd += num_bytes_rcvd;
 
 			// append to file
@@ -145,13 +161,64 @@ int main(){
 				
 				// Send to client
 				// go to beginning of file
-				send_file_data_to_client(total_bytes_rcvd);
+				send_file_data_to_client();
 
 
 			}
 		}
 	}
 }
+
+
+void daemonize(void){
+
+	pid_t pid;
+	
+	pid = fork();
+	
+	if(pid < 0){
+		error_handler("Error while daemon 1st fork: %s", errno);
+	}
+	if(pid > 0){
+		exit(EXIT_SUCCESS); // parent exits	
+	}
+	
+	
+	if(setsid() == -1){
+		error_handler("Error in setting session id: %s", errno);
+	}
+	
+	// Fork again to prevent accidental acquire of terminal
+	if(pid < 0){
+		error_handler("Error while daemon 2nd fork: %s", errno);
+	}
+	if(pid > 0){
+		exit(EXIT_SUCCESS); // 1st child exits	
+	}
+	
+	// Reset file permissions umask
+	umask(0);	
+	
+	int fd = open("/dev/null", O_RDWR);
+	if(fd == -1){
+		error_handler("Error in opening /dev/null: %s", errno);
+	}
+	
+	
+    if (dup2(fd, STDIN_FILENO) == -1 ||
+        dup2(fd, STDOUT_FILENO) == -1 ||
+        dup2(fd, STDERR_FILENO) == -1) {
+        close(fd);
+        error_handler("Error in dup2: %s", errno);
+    }
+	
+	if (fd > STDERR_FILENO) {
+        close(fd);
+    }
+    
+    syslog(LOG_DEBUG, "Daemonized successfully");
+}
+
 
 
 // Uses normal_fd
@@ -176,7 +243,7 @@ static void write_to_file(char *buf, size_t num_bytes_to_write){
 
 
 // Uses normal_fd, client_fd
-static void send_file_data_to_client(size_t num_bytes_to_send){
+static void send_file_data_to_client(void){
 	// Go to beginning of file
 	int status = lseek(normal_fd, 0, SEEK_SET);			
 
@@ -187,19 +254,18 @@ static void send_file_data_to_client(size_t num_bytes_to_send){
 
 	// write everything to send until all bytes sent
 	while(1){
-		if(num_bytes_to_send <= 0){
-			// sent all bytes
-			 syslog(LOG_DEBUG, "Bytes sent to client");
-
-			return;
-		}
 
 		// Read next set of bytes from file
 		char buf[SIZE_OF_RAM_BUFFER];
 		ssize_t num_bytes_read = 0;
 		
-		if((num_bytes_read = read(normal_fd, buf, SIZE_OF_RAM_BUFFER)) <= 0){
+		if((num_bytes_read = read(normal_fd, buf, SIZE_OF_RAM_BUFFER)) < 0){
 			error_handler("Error in reading from file: %s", errno);
+		}
+		else if(num_bytes_read == 0){
+			// sent all bytes
+			syslog(LOG_DEBUG, "Bytes sent to client");
+			return;
 		}
 
 
@@ -214,7 +280,7 @@ static void send_file_data_to_client(size_t num_bytes_to_send){
 
 			ssize_t num_bytes_sent = 0;
 
-			if((num_bytes_sent = send(client_fd, buf + total_sent, bytes_to_send, MSG_NOSIGNAL)) <= 0){	// MUST: Set proper flags
+			if((num_bytes_sent = send(client_fd, buf + total_sent, bytes_to_send, MSG_NOSIGNAL)) <= 0){
 			
 				error_handler("Error in sending bytes: %s", errno);
 			}
@@ -222,9 +288,6 @@ static void send_file_data_to_client(size_t num_bytes_to_send){
 			bytes_to_send -= num_bytes_sent;
 			total_sent += num_bytes_sent;
 		}
-
-
-		num_bytes_to_send -= num_bytes_read;
 	}
 
 }
@@ -270,12 +333,10 @@ static void error_handler(char *error_msg, int error_number){
 // Uses normal_fd, client_fd, socket_fd
 static void clean_up(void){
 
-	
 	if(normal_fd != -1){	
 		if(close(normal_fd) == -1){
 			syslog(LOG_ERR, "normal_fd close failed: %s", strerror(errno));
 		}
-		
 	}
 	
 	if (remove(output_filename) == -1) {
