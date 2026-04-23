@@ -7,3 +7,5 @@ aesd-build
 .vscode/
 test.sh.log
 temp/
+server/aesdsocket
+server/*.o
