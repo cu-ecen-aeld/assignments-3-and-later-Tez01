@@ -26,12 +26,13 @@
 #define SIZE_OF_RAM_BUFFER	1000
 
 static int socket_fd = 0;
-static int client_fd = 0;
 static int normal_fd = 0;
 
-void daemonize(void);
+static void daemonize(void);
 
-static void write_to_file(char *buf, size_t num_bytes_to_write);
+static void process_client(struct sockaddr_in client_addr);
+
+static void write_to_file(char *buf, ssize_t num_bytes_to_write);
 static void send_file_data_to_client(void);
 
 static void signal_handler(int signo);
@@ -42,13 +43,27 @@ static void clean_up(void);
 
 static char output_filename[] = "/var/tmp/aesdsocketdata";
 
+//------------------------------------------
+// typedefs
+//------------------------------------------
+typedef struct node{
+    pthread_t thread_id;
+    uint8_t thread_status;  // 0 = closed, 1 = open
+    static int client_fd = 0;
+    SLIST_ENTRY(node) entries;
+
+}node_t;
+
+
+struct node_head head;
+
+
 int main(int argc, char *argv[]){
 
 	socket_fd = -1;
 	client_fd = -1;
 	normal_fd = -1;
 
-	
 	// Enable logging
 	openlog("aesdsocket", LOG_PID, LOG_DAEMON);
 	
@@ -93,84 +108,162 @@ int main(int argc, char *argv[]){
 	}
 	
 	// Listen for new connections
-	if((status = listen(socket_fd, 5) != 0)){
+	if((status = listen(socket_fd, 5)) != 0){
 		error_handler("Could not listen: %s", errno);
 	}
 
-	
+    // Initialize linked list to store threads
+    SLIST_HEAD(node_head, node);
+
+    SLIST_INIT(&head);  // MUST: HAndle return values/errors of List
 
 	while(1){
 		// Accept new connection
 		struct sockaddr_in client_addr; // structure to save client data
 		socklen_t addrlen = sizeof(client_addr);
-		client_fd = accept(socket_fd, (struct sockaddr *)&client_addr, &addrlen); // Don't care about client's ip and port
+		int client_fd = accept(socket_fd, (struct sockaddr *)&client_addr, &addrlen); // Don't care about client's ip and port
 		if(client_fd == -1){
 			error_handler("Could not accept connection: %s", errno);
 		}
 
-		// Client connected	
-		char ip[INET_ADDRSTRLEN];
-		inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+        // Some client connected
 
-		syslog(LOG_DEBUG, "Accepted connection from %s", ip);
+        // Clean up closed/error threads
+        clean_up_closed_threads();
 
+        // add new client node to list
+        add_client_to_linked_list_head(client_fd);
 
-		char buffer[SIZE_OF_RAM_BUFFER];
-		ssize_t num_bytes_rcvd;
-		ssize_t total_bytes_rcvd = 0;
-		normal_fd = open(output_filename, O_CREAT | O_RDWR | O_APPEND, 0644);
-		if(normal_fd == -1){
-			error_handler("Error in opening file: %s", errno);
-		}
-		
-		while(1){
-			num_bytes_rcvd = recv(client_fd, buffer, sizeof(buffer), 0);
-
-			if(num_bytes_rcvd == 0){
-				if(close(client_fd) == -1){
-					error_handler("Close failed: %s", errno);
-				}
-				client_fd = -1;	// Make client fd invalid again
-				
-				syslog(LOG_DEBUG, "Closed connection from %s", ip);
-				break;
-			}
-			
-			
-			if(num_bytes_rcvd < 0){
-				error_handler("Error in receive: %s", errno);
-			}
-			
-			// Received some bytes
-			
-			
-			//---------Test Code------------
-//			for (ssize_t i = 0; i < num_bytes_rcvd; i++) {
-//				syslog(LOG_DEBUG, "buffer[%zd] = %d", i, (unsigned char)buffer[i]);
-//			}	
-			//---------Test Code------------
-			
-			total_bytes_rcvd += num_bytes_rcvd;
-
-			// append to file
-			write_to_file(buffer, num_bytes_rcvd);
+        // create thread
+        node_t *first = SLIST_FIRST(&head);
+        if(pthread_create(&(first->thread_id), NULL, process_client, first));
 
 
-			if(buffer[num_bytes_rcvd - 1] == '\n'){
-				// packet complete
-				
-				// Send to client
-				// go to beginning of file
-				send_file_data_to_client();
+        process_client(&(head->thread_id));
 
-
-			}
-		}
+        process_fatal_error_ahndler
+        process_signal_handler
 	}
 }
 
+static void add_client_to_linked_list_head(int client_fd){
+    node_t *client_node = malloc(sizeof(*client_node));
+    if(client_node == NULL){
+        error_handler("Could not malloc node: %s", errno);
+    }
 
-void daemonize(void){
+
+    client_node->client_fd = client_fd;
+    client_node->client_status = 1; // open
+
+    SLIST_INSERT_HEAD(&head, client_node, entries);
+}
+
+static void clean_up_closed_threads(void){ // MUST: Handle all syslogs at process level???
+    node_t *curr;
+    node_t *tmp;
+    SLIST_FOREACH_SAFE(curr, &head, entries, tmp) {
+        int thread_status = iter->thread_status;
+        if( thread_status == 0){    // MUST: Make thread error not fatal
+            // closed
+            // thread local cleanup ensures mutex released
+
+            syslog(LOG_DEBUG, "Closed connection from %s", ip);
+
+            // acknowledge thread return
+            if(pthread_join(iter->thread_id, NULL) != 0){// Don't care about return value
+                error_handler("Could not join thread: %s", errno);
+            }
+            
+            // Remove thread from list
+            SLIST_REMOVE(&head, curr, node, entries);   // MUST: Make O(1) - use TLIST or use next pointer in SLIST
+
+        }
+    }
+        
+}
+       
+
+// Assumes client_fd assigned
+static void process_client(struct sockaddr_in client_addr){
+
+    // create thread
+    
+        send
+        recv
+
+    // mutex file access
+        
+        thread_close_handler
+
+    
+        thread_fatal_error_handler
+        
+    Owns
+        client_fd
+
+
+    // Client connected
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+
+    syslog(LOG_DEBUG, "Accepted connection from %s", ip);
+
+
+    char buffer[SIZE_OF_RAM_BUFFER];
+    ssize_t num_bytes_rcvd;
+    ssize_t total_bytes_rcvd = 0;
+    normal_fd = open(output_filename, O_CREAT | O_RDWR | O_APPEND, 0644);
+    if(normal_fd == -1){
+        error_handler("Error in opening file: %s", errno);
+    }
+    
+    while(1){
+        num_bytes_rcvd = recv(client_fd, buffer, sizeof(buffer), 0);
+
+        if(num_bytes_rcvd == 0){
+            if(close(client_fd) == -1){
+                error_handler("Close failed: %s", errno);
+            }
+            client_fd = -1;	// Make client fd invalid again
+            
+            syslog(LOG_DEBUG, "Closed connection from %s", ip);
+            break;
+        }
+        
+        
+        if(num_bytes_rcvd < 0){
+            error_handler("Error in receive: %s", errno);
+        }
+        
+        // Received some bytes
+        
+        
+        //---------Test Code------------
+//			for (ssize_t i = 0; i < num_bytes_rcvd; i++) {
+//				syslog(LOG_DEBUG, "buffer[%zd] = %d", i, (unsigned char)buffer[i]);
+//			}	
+        //---------Test Code------------
+        
+        total_bytes_rcvd += num_bytes_rcvd;
+
+        // append to file
+        write_to_file(buffer, num_bytes_rcvd);
+
+
+        if(buffer[num_bytes_rcvd - 1] == '\n'){
+            // packet complete
+            
+            // Send to client
+            // go to beginning of file
+            send_file_data_to_client();
+
+
+        }
+    }
+}
+
+static void daemonize(void){
 
 	pid_t pid;
 	
@@ -222,7 +315,7 @@ void daemonize(void){
 
 
 // Uses normal_fd
-static void write_to_file(char *buf, size_t num_bytes_to_write){
+static void write_to_file(char *buf, ssize_t num_bytes_to_write){
 		
 	while(1){
 		if(num_bytes_to_write <= 0){
@@ -232,7 +325,7 @@ static void write_to_file(char *buf, size_t num_bytes_to_write){
 		}
 
 		ssize_t num_bytes_written = 0;
-		if((num_bytes_written = write(normal_fd, buf, num_bytes_to_write)) <= 0){
+		if((num_bytes_written = write(normal_fd, buf, (size_t)num_bytes_to_write)) <= 0){
 			error_handler("Error in writing to file: %s", errno);
 		}
 
@@ -245,7 +338,7 @@ static void write_to_file(char *buf, size_t num_bytes_to_write){
 // Uses normal_fd, client_fd
 static void send_file_data_to_client(void){
 	// Go to beginning of file
-	int status = lseek(normal_fd, 0, SEEK_SET);			
+	off_t status = lseek(normal_fd, 0, SEEK_SET);			
 
 	if(status == -1){
 		error_handler("Error in file seek: %s", errno);
@@ -270,7 +363,7 @@ static void send_file_data_to_client(void){
 
 
 		// Send read bytes to client
-		size_t bytes_to_send = num_bytes_read;
+		size_t bytes_to_send = (size_t)num_bytes_read;
 		ssize_t total_sent = 0;
 		while(1){	
 			if(bytes_to_send <= 0){
@@ -285,7 +378,7 @@ static void send_file_data_to_client(void){
 				error_handler("Error in sending bytes: %s", errno);
 			}
 			
-			bytes_to_send -= num_bytes_sent;
+			bytes_to_send -= (size_t)num_bytes_sent;
 			total_sent += num_bytes_sent;
 		}
 	}
@@ -294,6 +387,7 @@ static void send_file_data_to_client(void){
 
 
 static void signal_handler(int signo){
+    (void)signo; // ignore
 	syslog(LOG_ERR, "Caught signal, exiting");
 	clean_up();
 	exit(-1);
