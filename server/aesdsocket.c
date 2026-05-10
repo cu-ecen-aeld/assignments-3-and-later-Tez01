@@ -7,7 +7,6 @@
 
 #include <errno.h>
 
-#include <string.h>
 
 #include <netdb.h>
 
@@ -17,23 +16,53 @@
 
 #include <unistd.h>
 
+#include <pthread.h>
+
 #include <signal.h>
 
+#include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
+
+#include <stdatomic.h>
 
 #include <sys/stat.h>
+#include <sys/queue.h>
 
 #define SIZE_OF_RAM_BUFFER	1000
 
 static int socket_fd = 0;
 static int normal_fd = 0;
+pthread_mutex_t normal_fd_mutex;
 
+//------------------------------------------
+// Typedefs
+//------------------------------------------
+typedef struct node{
+    pthread_t thread_id;
+    int client_fd;
+    atomic_bool client_done; //  0 = closed, 1 = open
+    SLIST_ENTRY(node) entries;
+    char client_ip[INET_ADDRSTRLEN];
+}node_t;
+
+SLIST_HEAD(node_head, node);
+
+struct node_head head;
+
+
+//------------------------------------------
+// Static function prototypes
+//------------------------------------------
 static void daemonize(void);
 
-static void process_client(struct sockaddr_in client_addr);
+static void *process_client(void *client_node);
+
+static void clean_up_closed_threads(void);
+static void start_client_thread(int client_fd, char *ip);
 
 static void write_to_file(char *buf, ssize_t num_bytes_to_write);
-static void send_file_data_to_client(void);
+static void send_file_data_to_client(int client_fd);
 
 static void signal_handler(int signo);
 static void setup_signal_handlers(void);
@@ -43,25 +72,8 @@ static void clean_up(void);
 
 static char output_filename[] = "/var/tmp/aesdsocketdata";
 
-//------------------------------------------
-// typedefs
-//------------------------------------------
-typedef struct node{
-    pthread_t thread_id;
-    uint8_t thread_status;  // 0 = closed, 1 = open
-    static int client_fd = 0;
-    SLIST_ENTRY(node) entries;
-
-}node_t;
-
-
-struct node_head head;
-
-
 int main(int argc, char *argv[]){
-
 	socket_fd = -1;
-	client_fd = -1;
 	normal_fd = -1;
 
 	// Enable logging
@@ -99,7 +111,7 @@ int main(int argc, char *argv[]){
 		error_handler("Could not bind: %s", errno);
 	}
 	
-	free(servinfo);	// no use of servinfo now, free
+	freeaddrinfo(servinfo);	// no use of servinfo now, free
 
 	if(argc == 2){
 		if(strcmp(argv[1], "-d") == 0){
@@ -113,10 +125,10 @@ int main(int argc, char *argv[]){
 	}
 
     // Initialize linked list to store threads
-    SLIST_HEAD(node_head, node);
+    SLIST_INIT(&head);  // MUST: Handle return values/errors of Linked List macros
 
-    SLIST_INIT(&head);  // MUST: HAndle return values/errors of List
-
+    pthread_mutex_init(&normal_fd_mutex, NULL);
+    
 	while(1){
 		// Accept new connection
 		struct sockaddr_in client_addr; // structure to save client data
@@ -127,88 +139,84 @@ int main(int argc, char *argv[]){
 		}
 
         // Some client connected
+        
+        char ip[INET_ADDRSTRLEN];
+        const char *inet_ret = inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip)); // Get ip   
+        if(inet_ret == NULL){
+            error_handler("Could not get ip for connection: %s", errno);
+        }
 
         // Clean up closed/error threads
         clean_up_closed_threads();
 
-        // add new client node to list
-        add_client_to_linked_list_head(client_fd);
+        start_client_thread(client_fd, ip);
 
-        // create thread
-        node_t *first = SLIST_FIRST(&head);
-        if(pthread_create(&(first->thread_id), NULL, process_client, first));
-
-
-        process_client(&(head->thread_id));
-
-        process_fatal_error_ahndler
-        process_signal_handler
+        syslog(LOG_DEBUG, "Accepted connection from %s", ip);
 	}
 }
 
-static void add_client_to_linked_list_head(int client_fd){
-    node_t *client_node = malloc(sizeof(*client_node));
-    if(client_node == NULL){
-        error_handler("Could not malloc node: %s", errno);
-    }
-
-
-    client_node->client_fd = client_fd;
-    client_node->client_status = 1; // open
-
-    SLIST_INSERT_HEAD(&head, client_node, entries);
-}
 
 static void clean_up_closed_threads(void){ // MUST: Handle all syslogs at process level???
     node_t *curr;
     node_t *tmp;
-    SLIST_FOREACH_SAFE(curr, &head, entries, tmp) {
-        int thread_status = iter->thread_status;
-        if( thread_status == 0){    // MUST: Make thread error not fatal
+
+    curr = SLIST_FIRST(&head);
+
+    while (curr != NULL){
+        tmp = SLIST_NEXT(curr, entries);
+
+        if( atomic_load(&(curr->client_done)) == 0){    // MUST: Make thread error not fatal
             // closed
             // thread local cleanup ensures mutex released
-
-            syslog(LOG_DEBUG, "Closed connection from %s", ip);
-
+    
+            
             // acknowledge thread return
-            if(pthread_join(iter->thread_id, NULL) != 0){// Don't care about return value
+            if(pthread_join(curr->thread_id, NULL) != 0){// Don't care about return value
                 error_handler("Could not join thread: %s", errno);
             }
             
             // Remove thread from list
             SLIST_REMOVE(&head, curr, node, entries);   // MUST: Make O(1) - use TLIST or use next pointer in SLIST
-
+            
+            // free up node memory
+            free(curr);
+            
+            syslog(LOG_DEBUG, "Closed connection from %s", curr->client_ip);
         }
+
+        curr = tmp;
     }
-        
 }
-       
+
+
+static void start_client_thread(int client_fd, char *ip){
+    // add new client node to list head
+    node_t *client_node = malloc(sizeof(*client_node));
+    if(client_node == NULL){
+        error_handler("Could not malloc node: %s", errno);
+    }
+
+    // save node data
+    client_node->client_fd = client_fd;
+    atomic_store(&(client_node->client_done), false);
+
+    strcpy(client_node->client_ip, ip);
+
+    SLIST_INSERT_HEAD(&head, client_node, entries);
+
+    // create thread and pass in ll node as argument
+    if(pthread_create(&(client_node->thread_id), NULL, process_client, client_node) != 0){
+        error_handler("Could not create thread: %s", errno);
+    }
+
+
+    syslog(LOG_DEBUG, "Client processing thread created for ip:%s", ip);
+}
+
 
 // Assumes client_fd assigned
-static void process_client(struct sockaddr_in client_addr){
-
-    // create thread
-    
-        send
-        recv
-
-    // mutex file access
-        
-        thread_close_handler
-
-    
-        thread_fatal_error_handler
-        
-    Owns
-        client_fd
-
-
-    // Client connected
-    char ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
-
-    syslog(LOG_DEBUG, "Accepted connection from %s", ip);
-
+static void *process_client(void *arg_client_node){
+    node_t *client_node = arg_client_node;
 
     char buffer[SIZE_OF_RAM_BUFFER];
     ssize_t num_bytes_rcvd;
@@ -219,15 +227,11 @@ static void process_client(struct sockaddr_in client_addr){
     }
     
     while(1){
-        num_bytes_rcvd = recv(client_fd, buffer, sizeof(buffer), 0);
+        num_bytes_rcvd = recv(client_node->client_fd, buffer, sizeof(buffer), 0);
 
         if(num_bytes_rcvd == 0){
-            if(close(client_fd) == -1){
-                error_handler("Close failed: %s", errno);
-            }
-            client_fd = -1;	// Make client fd invalid again
-            
-            syslog(LOG_DEBUG, "Closed connection from %s", ip);
+            atomic_store(&(client_node->client_done), true);
+                                        // main will clean up and close client connection
             break;
         }
         
@@ -239,11 +243,11 @@ static void process_client(struct sockaddr_in client_addr){
         // Received some bytes
         
         
-        //---------Test Code------------
-//			for (ssize_t i = 0; i < num_bytes_rcvd; i++) {
-//				syslog(LOG_DEBUG, "buffer[%zd] = %d", i, (unsigned char)buffer[i]);
-//			}	
-        //---------Test Code------------
+//         //---------Test Code------------
+// //			for (ssize_t i = 0; i < num_bytes_rcvd; i++) {
+// //				syslog(LOG_DEBUG, "buffer[%zd] = %d", i, (unsigned char)buffer[i]);
+// //			}	
+//         //---------Test Code------------
         
         total_bytes_rcvd += num_bytes_rcvd;
 
@@ -256,11 +260,13 @@ static void process_client(struct sockaddr_in client_addr){
             
             // Send to client
             // go to beginning of file
-            send_file_data_to_client();
+            send_file_data_to_client(client_node->client_fd);
 
 
         }
     }
+
+    return NULL;
 }
 
 static void daemonize(void){
@@ -325,20 +331,26 @@ static void write_to_file(char *buf, ssize_t num_bytes_to_write){
 		}
 
 		ssize_t num_bytes_written = 0;
-		if((num_bytes_written = write(normal_fd, buf, (size_t)num_bytes_to_write)) <= 0){
+
+        pthread_mutex_lock(&normal_fd_mutex);
+        num_bytes_written = write(normal_fd, buf, (size_t)num_bytes_to_write);
+        pthread_mutex_unlock(&normal_fd_mutex);
+
+		if(num_bytes_written <= 0){
 			error_handler("Error in writing to file: %s", errno);
 		}
 
 		num_bytes_to_write -= num_bytes_written;
-
 	}	
 }
 
 
 // Uses normal_fd, client_fd
-static void send_file_data_to_client(void){
+static void send_file_data_to_client(int client_fd){
 	// Go to beginning of file
+    pthread_mutex_lock(&normal_fd_mutex);
 	off_t status = lseek(normal_fd, 0, SEEK_SET);			
+    pthread_mutex_unlock(&normal_fd_mutex);
 
 	if(status == -1){
 		error_handler("Error in file seek: %s", errno);
@@ -352,7 +364,11 @@ static void send_file_data_to_client(void){
 		char buf[SIZE_OF_RAM_BUFFER];
 		ssize_t num_bytes_read = 0;
 		
-		if((num_bytes_read = read(normal_fd, buf, SIZE_OF_RAM_BUFFER)) < 0){
+        pthread_mutex_lock(&normal_fd_mutex);
+        num_bytes_read = read(normal_fd, buf, SIZE_OF_RAM_BUFFER);
+        pthread_mutex_unlock(&normal_fd_mutex);
+        
+		if(num_bytes_read < 0){
 			error_handler("Error in reading from file: %s", errno);
 		}
 		else if(num_bytes_read == 0){
@@ -373,7 +389,10 @@ static void send_file_data_to_client(void){
 
 			ssize_t num_bytes_sent = 0;
 
-			if((num_bytes_sent = send(client_fd, buf + total_sent, bytes_to_send, MSG_NOSIGNAL)) <= 0){
+            pthread_mutex_lock(&normal_fd_mutex);
+            num_bytes_sent = send(client_fd, buf + total_sent, bytes_to_send, MSG_NOSIGNAL);
+            pthread_mutex_unlock(&normal_fd_mutex);
+			if(num_bytes_sent <= 0){
 			
 				error_handler("Error in sending bytes: %s", errno);
 			}
@@ -395,7 +414,8 @@ static void signal_handler(int signo){
 
 
 
-static void setup_signal_handlers(void){
+static void setup_signal_handlers(void){    // MUST: Use the setting flag and catch in main loop apporoach to ahdnle signals and
+                                            // errors
 	struct sigaction sa;
 	
 	memset(&sa, 0, sizeof(sa));
@@ -433,7 +453,7 @@ static void clean_up(void){
 		}
 	}
 	
-	if (remove(output_filename) == -1) {
+	if ((remove(output_filename) == -1) && (errno != ENOENT)) {
 		syslog(LOG_ERR, "remove failed: %s", strerror(errno));
 	}
 	
@@ -442,11 +462,23 @@ static void clean_up(void){
 			syslog(LOG_ERR, "socket_fd close failed: %s", strerror(errno));
 		}
 	}
-	if(client_fd != -1){
-		if(close(client_fd) == -1){
-			syslog(LOG_ERR, "client_fd close failed: %s", strerror(errno));
-		}
-	}
+
+    // Clear linked list
+    // Close any open connections
+    // node_t *curr;        // MUST: Implement
+
+    // while(!SLIST_EMPTY(&head)){
+    //     curr = SLIST_FIRST(&head);
+
+    //     SLIST_REMOVE_HEAD(&head, entries);
+
+    //     if(curr->)
+    // }
+	// if(client_fd != -1){
+	// 	if(close(client_fd) == -1){
+	// 		syslog(LOG_ERR, "client_fd close failed: %s", strerror(errno));
+	// 	}
+	// }
 
 }
 
