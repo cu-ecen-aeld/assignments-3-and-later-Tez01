@@ -362,9 +362,9 @@ static void clean_up_client_thread(node_t *client_node){
     SLIST_REMOVE(&head, client_node, node, entries);   // MUST: Make O(1) - use TLIST or use next pointer in SLIST
     
     // free up node memory
+    syslog(LOG_DEBUG, "Closed connection from %s", client_node->client_ip);
     free(client_node);
     
-    syslog(LOG_DEBUG, "Closed connection from %s", client_node->client_ip);
 }
 
 
