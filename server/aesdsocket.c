@@ -31,9 +31,15 @@
 
 #define SIZE_OF_RAM_BUFFER	1000
 
+//------------------------------------------
+// Static variables
+//------------------------------------------
 static int socket_fd = 0;
-static int normal_fd = 0;
-pthread_mutex_t normal_fd_mutex;
+static int output_fd = 0;
+static pthread_mutex_t output_fd_mutex;
+
+static volatile sig_atomic_t signal_exit_requested;
+static atomic_bool periodic_task_error_exit_requested;
 
 //------------------------------------------
 // Typedefs
@@ -50,6 +56,7 @@ SLIST_HEAD(node_head, node);
 
 struct node_head head;
 
+static const char output_filename[] = "/var/tmp/aesdsocketdata";
 
 //------------------------------------------
 // Static function prototypes
@@ -58,38 +65,48 @@ static void daemonize(void);
 
 static void *process_client(void *client_node);
 
-static void clean_up_closed_threads(void);
+static void clean_up_closed_client_threads(void);
+static void clean_up_all_client_threads(void);
+static void clean_up_client_thread(node_t *client_node);
+
 static void start_client_thread(int client_fd, char *ip);
 
-static void write_to_file(char *buf, ssize_t num_bytes_to_write);
-static void send_file_data_to_client(int client_fd);
+static int write_to_file(char *buf, ssize_t num_bytes_to_write);
+static int send_file_data_to_client(int client_fd);
 
 static void signal_handler(int signo);
-static void setup_signal_handlers(void);
+static int setup_signal_handlers(void);
 
-static void error_handler(char *error_msg, int error_number);
-static void clean_up(void);
+static void print_syscall_error(char *error_msg, int error_number);
 
-static char output_filename[] = "/var/tmp/aesdsocketdata";
+static void timestamp_thread_wake_handler(int signo);
+static void *periodic_thread(void *arg);
+
 
 int main(int argc, char *argv[]){
-	socket_fd = -1;
-	normal_fd = -1;
-
+    // Remove output file if already exist
+    if ((remove(output_filename) == -1) && (errno != ENOENT)) { // MUST: What happens if 2 isntances of this program run
+		print_syscall_error("remove of file failed: %s", errno);
+        goto ERROR;
+	}
+	
 	// Enable logging
 	openlog("aesdsocket", LOG_PID, LOG_DAEMON);
 	
 	// Register signal handlers
-	setup_signal_handlers();
+	if(setup_signal_handlers() == -1){
+        goto ERROR;
+    }
 	
 	// create a socket
 	socket_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if(socket_fd == -1){
-		error_handler("Could not create socket: %s", errno);
+		print_syscall_error("Could not create socket: %s", errno);
+        goto FAIL_SOCKET;
 	}
 
 	int opt = 1;	
-	setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); // MUST: Check return?
 
 	// bind socket
 	int status;
@@ -102,40 +119,60 @@ int main(int argc, char *argv[]){
 	hints.ai_flags = AI_PASSIVE;	// fill in my IP for me
 
 	if((status = getaddrinfo(NULL, "9000", &hints, &servinfo)) != 0){
-		error_handler("Could not getaddrinfo: %s", errno);
+		print_syscall_error("Could not getaddrinfo: %s", errno);
+        goto FAIL_SOCKET;
 	}
 	
 	// servinfo now points to a linked list of 1 or more struct addrinfos
 
 	if((status = bind(socket_fd, servinfo->ai_addr, servinfo->ai_addrlen)) != 0){
-		error_handler("Could not bind: %s", errno);
+		print_syscall_error("Could not bind: %s", errno);
+        goto FAIL_SOCKET;
 	}
 	
 	freeaddrinfo(servinfo);	// no use of servinfo now, free
 
 	if(argc == 2){
 		if(strcmp(argv[1], "-d") == 0){
-			daemonize();
+			daemonize();    // MUST: Handle errors
 		}
 	}
 	
 	// Listen for new connections
 	if((status = listen(socket_fd, 5)) != 0){
-		error_handler("Could not listen: %s", errno);
+		print_syscall_error("Could not listen: %s", errno);
+        goto FAIL_SOCKET;
 	}
+
+    // open output file and save fd
+    output_fd = open(output_filename, O_CREAT | O_RDWR | O_APPEND, 0644);   // No need of mutex
+    if(output_fd == -1){
+        print_syscall_error("Error in opening output file: %s", errno);
+        goto FAIL_SOCKET;
+    }
+
+    // Create period task to log timestamp
+    pthread_t timestamp_thread; 
+    if(pthread_create(&(timestamp_thread), NULL, periodic_thread, NULL) != 0){
+        print_syscall_error("Could not timestamp_log thread: %s", errno);
+        goto FAIL_OUTPUT_FILE;
+    }    
 
     // Initialize linked list to store threads
     SLIST_INIT(&head);  // MUST: Handle return values/errors of Linked List macros
 
-    pthread_mutex_init(&normal_fd_mutex, NULL);
-    
-	while(1){
+    pthread_mutex_init(&output_fd_mutex, NULL); // MUST: Check return???
+
+	while((!signal_exit_requested) && (!atomic_load(&periodic_task_error_exit_requested))){
 		// Accept new connection
 		struct sockaddr_in client_addr; // structure to save client data
 		socklen_t addrlen = sizeof(client_addr);
+        syslog(LOG_DEBUG, "Waiting for client connection");
 		int client_fd = accept(socket_fd, (struct sockaddr *)&client_addr, &addrlen); // Don't care about client's ip and port
+        syslog(LOG_DEBUG, "DEBUG: accept returned, client_fd=%d", client_fd);
 		if(client_fd == -1){
-			error_handler("Could not accept connection: %s", errno);
+			print_syscall_error("Could not accept connection: %s", errno);
+            continue;
 		}
 
         // Some client connected
@@ -143,20 +180,142 @@ int main(int argc, char *argv[]){
         char ip[INET_ADDRSTRLEN];
         const char *inet_ret = inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip)); // Get ip   
         if(inet_ret == NULL){
-            error_handler("Could not get ip for connection: %s", errno);
+            print_syscall_error("Could not get ip for connection: %s", errno);
         }
 
         // Clean up closed/error threads
-        clean_up_closed_threads();
+        clean_up_closed_client_threads();
 
         start_client_thread(client_fd, ip);
 
         syslog(LOG_DEBUG, "Accepted connection from %s", ip);
 	}
+
+
+
+    // Error/ signal handling
+    // Cleanup everything in reverse order of setup
+    
+    clean_up_all_client_threads();
+
+    if(atomic_load(&periodic_task_error_exit_requested) == 0){
+        // Exit not requested by thread
+        // Otherwise it would have exited itself already
+        if(pthread_kill(timestamp_thread, SIGUSR1) != 0){
+            print_syscall_error("Could not kill time_stamp thread: %s", errno);
+        }
+    }
+    if(pthread_join(timestamp_thread, NULL) != 0){// Don't care about return value
+        print_syscall_error("Could not join time_stamp thread: %s", errno);
+    }
+
+    FAIL_OUTPUT_FILE:
+        if(close(output_fd) == -1){
+            print_syscall_error("output_fd close failed: %s", errno);
+        }
+
+    FAIL_SOCKET:
+        if(close(socket_fd) == -1){
+			print_syscall_error("socket_fd close failed: %s", errno);
+		}
+
+    ERROR: exit(-1);
+
 }
 
 
-static void clean_up_closed_threads(void){ // MUST: Handle all syslogs at process level???
+static void timestamp_thread_wake_handler(int signo)
+{
+    (void)signo;
+    // Do nothing, just want to wake up thread from sleep
+    // to allow exit gracefully
+}
+
+static void *periodic_thread(void *arg)
+{
+    (void)arg;
+
+    struct timespec next;
+
+    atomic_store(&periodic_task_error_exit_requested, false);
+
+    // Get current monotonic time
+    int ret = clock_gettime(CLOCK_MONOTONIC, &next);
+    if (ret == -1) {
+        // real error
+        if(ret == EINTR){
+            // Signal arrived to kill process
+        }
+        else{
+            // Some other error
+            atomic_store(&periodic_task_error_exit_requested, true);
+        }
+        print_syscall_error("clock_gettime failed", errno);
+        return NULL;
+    }
+
+    while (1)
+    {
+        // -------- periodic work --------
+        char time_str[128];
+
+        time_t now = time(NULL);
+
+        struct tm tm_now;
+
+        if (localtime_r(&now, &tm_now) != NULL) {
+
+            strftime(time_str,
+                    sizeof(time_str),
+                    "timestamp:%a, %d %b %Y %H:%M:%S %z\n",
+                    &tm_now);
+
+            syslog(LOG_DEBUG,
+                "%s",
+                time_str);
+
+            // write to file
+            write_to_file(time_str, (ssize_t)(strlen(time_str)));
+
+        }
+        else {
+            // real error
+            print_syscall_error("localtime_r failed", errno);
+            atomic_store(&periodic_task_error_exit_requested, true);
+            break;
+        }
+
+        // --------------------------------
+
+        // Next wakeup = +10 second
+        next.tv_sec += 10;
+
+        ret = clock_nanosleep(CLOCK_MONOTONIC,
+                                  TIMER_ABSTIME,
+                                  &next,
+                                  NULL);
+        if (ret != 0)
+        {
+            if(ret == EINTR){
+                // Signal arrived to kill process
+                syslog(LOG_DEBUG, "signal arrived in periodic thread to kill process");
+                break;
+            }   
+            else{
+                // real error
+                syslog(LOG_ERR, "clock_nanosleep failed");
+                atomic_store(&periodic_task_error_exit_requested, true);
+                break;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+
+static void clean_up_closed_client_threads(void){ // MUST: Handle all syslogs at process level???
+    syslog(LOG_DEBUG, "Cleaning up closed client threads");
     node_t *curr;
     node_t *tmp;
 
@@ -165,35 +324,61 @@ static void clean_up_closed_threads(void){ // MUST: Handle all syslogs at proces
     while (curr != NULL){
         tmp = SLIST_NEXT(curr, entries);
 
-        if( atomic_load(&(curr->client_done)) == 0){    // MUST: Make thread error not fatal
+        if( atomic_load(&(curr->client_done)) == true){    // MUST: Make thread error not fatal
             // closed
-            // thread local cleanup ensures mutex released
-    
             
-            // acknowledge thread return
-            if(pthread_join(curr->thread_id, NULL) != 0){// Don't care about return value
-                error_handler("Could not join thread: %s", errno);
-            }
-            
-            // Remove thread from list
-            SLIST_REMOVE(&head, curr, node, entries);   // MUST: Make O(1) - use TLIST or use next pointer in SLIST
-            
-            // free up node memory
-            free(curr);
-            
-            syslog(LOG_DEBUG, "Closed connection from %s", curr->client_ip);
+            clean_up_client_thread(curr);
         }
 
         curr = tmp;
     }
 }
 
+static void clean_up_all_client_threads(void){
+    syslog(LOG_DEBUG, "Cleaning up all client threads");
+    node_t *curr;
+    node_t *tmp;
+
+    curr = SLIST_FIRST(&head);
+
+    while (curr != NULL){
+        tmp = SLIST_NEXT(curr, entries);
+
+        shutdown(curr->client_fd, SHUT_RDWR);  // To unblock client_thread from recv
+        clean_up_client_thread(curr);
+
+        curr = tmp;
+    }
+}
+
+static void clean_up_client_thread(node_t *client_node){
+
+    // acknowledge thread return
+    if(pthread_join(client_node->thread_id, NULL) != 0){// Don't care about return value
+        print_syscall_error("Could not join thread: %s", errno);
+    }
+    
+    // Remove thread from list
+    SLIST_REMOVE(&head, client_node, node, entries);   // MUST: Make O(1) - use TLIST or use next pointer in SLIST
+    
+    // free up node memory
+    free(client_node);
+    
+    syslog(LOG_DEBUG, "Closed connection from %s", client_node->client_ip);
+}
+
 
 static void start_client_thread(int client_fd, char *ip){
+    syslog(LOG_DEBUG, "Starting client thread");
     // add new client node to list head
     node_t *client_node = malloc(sizeof(*client_node));
     if(client_node == NULL){
-        error_handler("Could not malloc node: %s", errno);
+        print_syscall_error("Could not malloc node: %s", errno);
+        if(close(client_node->client_fd) == -1){
+            print_syscall_error("Close failed: %s", errno);
+        }
+        syslog(LOG_DEBUG, "Closed connection from %s", ip);
+        return;
     }
 
     // save node data
@@ -206,12 +391,21 @@ static void start_client_thread(int client_fd, char *ip){
 
     // create thread and pass in ll node as argument
     if(pthread_create(&(client_node->thread_id), NULL, process_client, client_node) != 0){
-        error_handler("Could not create thread: %s", errno);
+        print_syscall_error("Could not create thread: %s", errno);
+
+        if(close(client_node->client_fd) == -1){
+            print_syscall_error("Close failed: %s", errno);
+        }
+        SLIST_REMOVE(&head, client_node, node, entries);
+        free(client_node);
+        syslog(LOG_DEBUG, "Closed connection from %s", client_node->client_ip);
+        return;
     }
 
 
     syslog(LOG_DEBUG, "Client processing thread created for ip:%s", ip);
 }
+
 
 
 // Assumes client_fd assigned
@@ -221,28 +415,21 @@ static void *process_client(void *arg_client_node){
     char buffer[SIZE_OF_RAM_BUFFER];
     ssize_t num_bytes_rcvd;
     ssize_t total_bytes_rcvd = 0;
-    normal_fd = open(output_filename, O_CREAT | O_RDWR | O_APPEND, 0644);
-    if(normal_fd == -1){
-        error_handler("Error in opening file: %s", errno);
-    }
     
     while(1){
         num_bytes_rcvd = recv(client_node->client_fd, buffer, sizeof(buffer), 0);
 
         if(num_bytes_rcvd == 0){
-            atomic_store(&(client_node->client_done), true);
-                                        // main will clean up and close client connection
-            break;
+            // connection closed
+            goto CLOSE_CLIENT;
         }
         
-        
         if(num_bytes_rcvd < 0){
-            error_handler("Error in receive: %s", errno);
+            print_syscall_error("Error in receive: %s", errno);
+            goto CLOSE_CLIENT;
         }
         
         // Received some bytes
-        
-        
 //         //---------Test Code------------
 // //			for (ssize_t i = 0; i < num_bytes_rcvd; i++) {
 // //				syslog(LOG_DEBUG, "buffer[%zd] = %d", i, (unsigned char)buffer[i]);
@@ -252,44 +439,54 @@ static void *process_client(void *arg_client_node){
         total_bytes_rcvd += num_bytes_rcvd;
 
         // append to file
-        write_to_file(buffer, num_bytes_rcvd);
-
+        if(write_to_file(buffer, num_bytes_rcvd) == -1){
+            goto CLOSE_CLIENT;
+        }
 
         if(buffer[num_bytes_rcvd - 1] == '\n'){
             // packet complete
             
             // Send to client
             // go to beginning of file
-            send_file_data_to_client(client_node->client_fd);
-
-
+             if(send_file_data_to_client(client_node->client_fd) == -1){
+                goto CLOSE_CLIENT;
+             }
         }
     }
 
-    return NULL;
+    CLOSE_CLIENT:
+        if(close(client_node->client_fd) == -1){
+            print_syscall_error("Close failed: %s", errno);
+        }
+        atomic_store(&(client_node->client_done), true);    // FUTURE: Create thread_status instead of 0/1
+                                                            // main will clean up node
+        return NULL;   
+    
 }
 
-static void daemonize(void){
+static void daemonize(void){    // MUST: Handle errors?
 
 	pid_t pid;
 	
 	pid = fork();
-	
 	if(pid < 0){
-		error_handler("Error while daemon 1st fork: %s", errno);
+        // child never created
+		print_syscall_error("Error while daemon 1st fork: %s", errno);
 	}
 	if(pid > 0){
 		exit(EXIT_SUCCESS); // parent exits	
 	}
 	
-	
+	// pid == 0, this is child
+    // child continues
+
 	if(setsid() == -1){
-		error_handler("Error in setting session id: %s", errno);
+		print_syscall_error("Error in setting session id: %s", errno);
 	}
 	
 	// Fork again to prevent accidental acquire of terminal
 	if(pid < 0){
-		error_handler("Error while daemon 2nd fork: %s", errno);
+		print_syscall_error("Error while daemon 2nd fork: %s", errno);
 	}
 	if(pid > 0){
 		exit(EXIT_SUCCESS); // 1st child exits	
@@ -300,7 +497,7 @@ static void daemonize(void){
 	
 	int fd = open("/dev/null", O_RDWR);
 	if(fd == -1){
-		error_handler("Error in opening /dev/null: %s", errno);
+		print_syscall_error("Error in opening /dev/null: %s", errno);
 	}
 	
 	
@@ -308,7 +505,7 @@ static void daemonize(void){
         dup2(fd, STDOUT_FILENO) == -1 ||
         dup2(fd, STDERR_FILENO) == -1) {
         close(fd);
-        error_handler("Error in dup2: %s", errno);
+        print_syscall_error("Error in dup2: %s", errno);
     }
 	
 	if (fd > STDERR_FILENO) {
@@ -320,24 +517,25 @@ static void daemonize(void){
 
 
 
-// Uses normal_fd
-static void write_to_file(char *buf, ssize_t num_bytes_to_write){
+// Uses output_fd
+static int write_to_file(char *buf, ssize_t num_bytes_to_write){
 		
 	while(1){
 		if(num_bytes_to_write <= 0){
 			// all bytes written
 			syslog(LOG_DEBUG, "Bytes written to file successfully");
-			return;
+			return 0;
 		}
 
 		ssize_t num_bytes_written = 0;
 
-        pthread_mutex_lock(&normal_fd_mutex);
-        num_bytes_written = write(normal_fd, buf, (size_t)num_bytes_to_write);
-        pthread_mutex_unlock(&normal_fd_mutex);
+        pthread_mutex_lock(&output_fd_mutex);
+        num_bytes_written = write(output_fd, buf, (size_t)num_bytes_to_write);
+        pthread_mutex_unlock(&output_fd_mutex);
 
 		if(num_bytes_written <= 0){
-			error_handler("Error in writing to file: %s", errno);
+			print_syscall_error("Error in writing to file: %s", errno);
+            return -1;
 		}
 
 		num_bytes_to_write -= num_bytes_written;
@@ -345,15 +543,16 @@ static void write_to_file(char *buf, ssize_t num_bytes_to_write){
 }
 
 
-// Uses normal_fd, client_fd
-static void send_file_data_to_client(int client_fd){
+// Uses output_fd, client_fd
+static int  send_file_data_to_client(int client_fd){
 	// Go to beginning of file
-    pthread_mutex_lock(&normal_fd_mutex);
-	off_t status = lseek(normal_fd, 0, SEEK_SET);			
-    pthread_mutex_unlock(&normal_fd_mutex);
+    pthread_mutex_lock(&output_fd_mutex);
+	off_t status = lseek(output_fd, 0, SEEK_SET);			
+    pthread_mutex_unlock(&output_fd_mutex);
 
 	if(status == -1){
-		error_handler("Error in file seek: %s", errno);
+		print_syscall_error("Error in file seek: %s", errno);
+        return -1;
 	}
 
 
@@ -364,17 +563,18 @@ static void send_file_data_to_client(int client_fd){
 		char buf[SIZE_OF_RAM_BUFFER];
 		ssize_t num_bytes_read = 0;
 		
-        pthread_mutex_lock(&normal_fd_mutex);
-        num_bytes_read = read(normal_fd, buf, SIZE_OF_RAM_BUFFER);
-        pthread_mutex_unlock(&normal_fd_mutex);
+        pthread_mutex_lock(&output_fd_mutex);
+        num_bytes_read = read(output_fd, buf, SIZE_OF_RAM_BUFFER);
+        pthread_mutex_unlock(&output_fd_mutex);
         
 		if(num_bytes_read < 0){
-			error_handler("Error in reading from file: %s", errno);
+			print_syscall_error("Error in reading from file: %s", errno);
+            return -1;
 		}
 		else if(num_bytes_read == 0){
 			// sent all bytes
 			syslog(LOG_DEBUG, "Bytes sent to client");
-			return;
+			return 0;
 		}
 
 
@@ -389,12 +589,12 @@ static void send_file_data_to_client(int client_fd){
 
 			ssize_t num_bytes_sent = 0;
 
-            pthread_mutex_lock(&normal_fd_mutex);
+            pthread_mutex_lock(&output_fd_mutex);
             num_bytes_sent = send(client_fd, buf + total_sent, bytes_to_send, MSG_NOSIGNAL);
-            pthread_mutex_unlock(&normal_fd_mutex);
+            pthread_mutex_unlock(&output_fd_mutex);
 			if(num_bytes_sent <= 0){
-			
-				error_handler("Error in sending bytes: %s", errno);
+				print_syscall_error("Error in sending bytes: %s", errno);
+                return -1;
 			}
 			
 			bytes_to_send -= (size_t)num_bytes_sent;
@@ -408,78 +608,49 @@ static void send_file_data_to_client(int client_fd){
 static void signal_handler(int signo){
     (void)signo; // ignore
 	syslog(LOG_ERR, "Caught signal, exiting");
-	clean_up();
-	exit(-1);
+	signal_exit_requested = 1;
 }
 
 
 
-static void setup_signal_handlers(void){    // MUST: Use the setting flag and catch in main loop apporoach to ahdnle signals and
+static int setup_signal_handlers(void){    // MUST: Use the setting flag and catch in main loop apporoach to ahdnle signals and
                                             // errors
 	struct sigaction sa;
 	
+    // timestamp thread signal handler
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = timestamp_thread_wake_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+
+    sigaction(SIGUSR1, &sa, NULL);
+
+
+    // global signal handlers
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = signal_handler;
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = 0;
-	
+    signal_exit_requested = 0; // After this signal can arrive and can set this flag
+
 	if(sigaction(SIGINT, &sa, NULL) == -1){
-		error_handler("Error in setting up SIGINT sigaction: %s", errno);
+		print_syscall_error("Error in setting up SIGINT sigaction: %s", errno);
+        return -1;
 	}
 	
 	if(sigaction(SIGTERM, &sa, NULL) == -1){
-		error_handler("Error in setting up SIGTERM sigaction: %s", errno);
+		print_syscall_error("Error in setting up SIGTERM sigaction: %s", errno);
+        return -1;
 	}
 
-}
+    return 0;
 
+}
 
 // WARNING: error_msg must be null terminated and
 //		must contain placeholder(%s) for displaying errno
-static void error_handler(char *error_msg, int error_number){
-	
-	syslog(LOG_ERR, error_msg, strerror(error_number));
-	clean_up();
-	exit(-1);
-}
-
-
-// Uses normal_fd, client_fd, socket_fd
-static void clean_up(void){
-
-	if(normal_fd != -1){	
-		if(close(normal_fd) == -1){
-			syslog(LOG_ERR, "normal_fd close failed: %s", strerror(errno));
-		}
-	}
-	
-	if ((remove(output_filename) == -1) && (errno != ENOENT)) {
-		syslog(LOG_ERR, "remove failed: %s", strerror(errno));
-	}
-	
-	if(socket_fd != -1){
-		if(close(socket_fd) == -1){
-			syslog(LOG_ERR, "socket_fd close failed: %s", strerror(errno));
-		}
-	}
-
-    // Clear linked list
-    // Close any open connections
-    // node_t *curr;        // MUST: Implement
-
-    // while(!SLIST_EMPTY(&head)){
-    //     curr = SLIST_FIRST(&head);
-
-    //     SLIST_REMOVE_HEAD(&head, entries);
-
-    //     if(curr->)
-    // }
-	// if(client_fd != -1){
-	// 	if(close(client_fd) == -1){
-	// 		syslog(LOG_ERR, "client_fd close failed: %s", strerror(errno));
-	// 	}
-	// }
-
+static void print_syscall_error(char *error_msg, int error_number){
+    syslog(LOG_ERR, error_msg, strerror(error_number));
 }
 
 
@@ -487,3 +658,12 @@ static void clean_up(void){
 
 
 
+
+
+// Lessons
+//   Error Handling should be handled as local as possible
+//   or as soon above as possible
+//   Not every error should be signaled above and has to shutdown whole system
+//   Sometimes a policy to handle error is to just log and move on
+//   Let signal etc be handled by normal function flow itself
+//         instead of abruptly shutting everything down
