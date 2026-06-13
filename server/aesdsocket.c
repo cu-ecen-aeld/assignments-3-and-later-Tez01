@@ -519,18 +519,17 @@ static void daemonize(void){    // MUST: Handle errors?
 
 // Uses output_fd
 static int write_to_file(char *buf, ssize_t num_bytes_to_write){
-		
-	while(1){
-		if(num_bytes_to_write <= 0){
-			// all bytes written
-			syslog(LOG_DEBUG, "Bytes written to file successfully");
-			return 0;
-		}
+	
+    ssize_t total_written = 0;
+
+	while(total_written < num_bytes_to_write){
 
 		ssize_t num_bytes_written = 0;
 
         pthread_mutex_lock(&output_fd_mutex);
-        num_bytes_written = write(output_fd, buf, (size_t)num_bytes_to_write);
+        num_bytes_written = write(output_fd, 
+                buf + total_written,
+                (size_t)num_bytes_to_write - total_written);
         pthread_mutex_unlock(&output_fd_mutex);
 
 		if(num_bytes_written <= 0){
@@ -538,8 +537,12 @@ static int write_to_file(char *buf, ssize_t num_bytes_to_write){
             return -1;
 		}
 
-		num_bytes_to_write -= num_bytes_written;
+        total_written += num_bytes_written;
 	}	
+
+    // all bytes written
+    syslog(LOG_DEBUG, "Bytes written to file successfully");
+    return 0;
 }
 
 

@@ -16,6 +16,7 @@
 
 #include "aesd-circular-buffer.h"
 
+
 /**
  * @param buffer the buffer to search for corresponding offset.  Any necessary locking must be performed by caller.
  * @param char_offset the position to search for in the buffer list, describing the zero referenced
@@ -58,7 +59,6 @@ CHKFR_OFFSET:
         // offset futher away in buffer
         curr_offset = curr_offset - curr_size;
 
-
         curr_elem++;
         if(curr_elem >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED){
             // roll over
@@ -70,6 +70,7 @@ CHKFR_OFFSET:
     return NULL;
 }
 
+
 /**
 * Adds entry @param add_entry to @param buffer in the location specified in buffer->in_offs.
 * If the buffer was already full, overwrites the oldest entry and advances buffer->out_offs to the
@@ -77,7 +78,8 @@ CHKFR_OFFSET:
 * Any necessary locking must be handled by the caller
 * Any memory referenced in @param add_entry must be allocated by and/or must have a lifetime managed by the caller.
 */
-void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry)
+void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer,
+     const struct aesd_buffer_entry *add_entry)
 {
     /**
     * TODO: implement per description
@@ -111,3 +113,11 @@ void aesd_circular_buffer_init(struct aesd_circular_buffer *buffer)
 {
     memset(buffer,0,sizeof(struct aesd_circular_buffer));
 }
+
+
+// Reasons to pass pointer into function rather than element itself
+// 1. Use same code for multiple data
+//         Object oriented paradigm -pointer is object and function is method
+// 2. Sometimes we want to change actual element in place, rather than copy
+// 3. efficient if arguments are large, 
+//         eg: passing large struct is inefficient
