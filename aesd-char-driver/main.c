@@ -17,6 +17,7 @@
 #include <linux/types.h>
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
+#include <linux/slab.h>
 #include "aesdchar.h"
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
@@ -82,57 +83,68 @@ static ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
         goto EXIT_READ;
     }
     
-    ssize_t upto_entry_offset;
-    struct aesd_buffer_entry *upto_entry = 
-                                aesd_circular_buffer_find_entry_offset_for_fpos(
-                                &(dev->circular_buffer),
-                                (*f_pos) + count,
-                                &upto_entry_offset
-                            );
-
-
-    if(upto_entry!=NULL){
-        size_t num_bytes_remaining = count;
-        loff_t offset = *f_pos;
-        while(1){
-            ssize_t curr_entry_offset;
-            struct aesd_buffer_entry *curr_entry = aesd_circular_buffer_find_entry_offset_for_fpos(
-                                                        &(dev->circular_buffer),
-                                                        offset,
-                                                        &curr_entry_offset);
-
-            size_t num_bytes_unread_in_curr = curr_entry->size - curr_entry_offset;
-            if(num_bytes_unread_in_curr >= num_bytes_remaining){
-                // all data within current element
-                // copy count bytes         
-                unsigned long bytes_not_copied = copy_to_user(
-                                                        buf,
-                                                        &(curr_entry[curr_entry_offset]),
-                                                        num_bytes_remaining);
-                            // MUST: this can copy less bytes than wanted to read
-                            //          Retry until all read
-                                    
-                                                        
-                *f_pos += retval;   
-                retval = count - bytes_not_copied;
-                goto EXIT_READ;
-            }
-            else{
-                // some data in next element
-                // copy until end of this entry
-                unsigned long bytes_not_copied = copy_to_user(buf,
-                                             &(curr_entry[curr_entry_offset]),
-                                             num_bytes_unread_in_curr);
-
-                size_t num_bytes_read = num_bytes_unread_in_curr - bytes_not_copied;
-
-                num_bytes_remaining -= num_bytes_read;
-                offset += num_bytes_read;
-            }
+   
+    size_t num_bytes_remaining = count;
+    size_t total_num_bytes_copied = 0;
+    loff_t offset = *f_pos;
+    
+    while(num_bytes_remaining > 0){
+        ssize_t curr_entry_offset;
+        struct aesd_buffer_entry *curr_entry = aesd_circular_buffer_find_entry_offset_for_fpos(
+                                                    &(dev->circular_buffer),
+                                                    offset,
+                                                    &curr_entry_offset);
+		
+		if(curr_entry == NULL){
+        	PDEBUG("End of buffer");
+        	break;
         }
+        else{
+			PDEBUG("currently at %p size=%zu offset=%zu",
+				curr_entry,
+		   		curr_entry->size,
+		   		curr_entry_offset);
+	   	
+	   		size_t num_bytes_copied = 0;
+	        size_t num_bytes_unread_in_curr = curr_entry->size - curr_entry_offset;
+	        if(num_bytes_unread_in_curr >= num_bytes_remaining){
+	            // all data within current element
+	            // copy count bytes        
+				PDEBUG("All data in cur, num_bytes_remaining = %zu", num_bytes_remaining); 
+				
+	            unsigned long bytes_not_copied = copy_to_user(
+	                                                    buf,
+	                                                    curr_entry->buffptr + curr_entry_offset,
+	                                                    num_bytes_remaining);
+	                        // MUST: this can copy less bytes than wanted to read
+	                        //          Retry until all read
+	                                
+	           	num_bytes_copied = num_bytes_remaining - bytes_not_copied;
+	        }
+	        else{
+	            // some data in next element
+	            // copy until end of this entry
+	            PDEBUG("Some data in next");
+	             
+	            unsigned long bytes_not_copied = copy_to_user(buf,
+	                                         curr_entry->buffptr + curr_entry_offset,
+	                                         num_bytes_unread_in_curr);
+
+	            num_bytes_copied = num_bytes_unread_in_curr - bytes_not_copied;
+
+	        }
+	        
+	        buf += num_bytes_copied;
+            offset += num_bytes_copied;
+            total_num_bytes_copied += num_bytes_copied;
+            num_bytes_remaining -= num_bytes_copied;
+        }
+
     }
 
 EXIT_READ:
+	retval += total_num_bytes_copied;
+	*f_pos += retval;
     mutex_unlock(&(dev->lock));
     
     return retval;
@@ -174,7 +186,14 @@ static ssize_t aesd_write(struct file *filp,
     dev->partial_buffer.buffptr = new_buf;
     dev->partial_buffer.size += retval;
 
-    if(buf[count] == '\n'){
+	PDEBUG("copied %zu bytes", retval);
+			   
+    if(buf[count - 1] == '\n'){
+    	PDEBUG("adding entry size=%zu data=%.*s",
+		       dev->partial_buffer.size,
+		       (int)dev->partial_buffer.size,
+		       dev->partial_buffer.buffptr);
+       
         aesd_circular_buffer_add_entry(&(dev->circular_buffer),
                                     &(dev->partial_buffer));
 
@@ -241,6 +260,9 @@ static int aesd_init_module(void)
     if( result ) {
         unregister_chrdev_region(dev, 1);
     }
+    else{
+        printk(KERN_INFO "aesd char device loaded\n");
+    }
     return result;
 
 }
@@ -275,6 +297,8 @@ static void aesd_cleanup_module(void)
 
 
     unregister_chrdev_region(devno, 1);
+    
+    printk(KERN_INFO "aesd char device unloaded\n");
 }
 
 

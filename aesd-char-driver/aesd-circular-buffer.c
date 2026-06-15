@@ -48,6 +48,7 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
         // curr == in but buffer is full
 
 CHKFR_OFFSET:        
+	;
         size_t curr_size = buffer->entry[curr_elem].size;
         if(curr_offset <= (curr_size - 1)){ // NOTE: Assumed curr_elem->num_elements atleast 1 
             // offset lies in current element
