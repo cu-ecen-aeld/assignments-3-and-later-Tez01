@@ -35,7 +35,6 @@
 // Static variables
 //------------------------------------------
 static int socket_fd = 0;
-static int output_fd = 0;
 static pthread_mutex_t output_fd_mutex;
 
 static volatile sig_atomic_t signal_exit_requested;
@@ -56,7 +55,11 @@ SLIST_HEAD(node_head, node);
 
 struct node_head head;
 
+#if(USE_AESD_CHAR_DEVICE == 1)
 static const char output_filename[] = "/var/tmp/aesdsocketdata";
+#else
+static const char output_filename[] = "/dev/aesdchar";
+#endif
 
 //------------------------------------------
 // Static function prototypes
@@ -71,8 +74,11 @@ static void clean_up_client_thread(node_t *client_node);
 
 static void start_client_thread(int client_fd, char *ip);
 
-static int write_to_file(char *buf, ssize_t num_bytes_to_write);
-static int send_file_data_to_client(int client_fd);
+static int write_to_file(int output_fd,
+                        char *buf,
+                        size_t num_bytes_to_write);
+
+static int  send_file_data_to_client(int output_fd, int client_fd);
 
 static void signal_handler(int signo);
 static int setup_signal_handlers(void);
@@ -84,12 +90,15 @@ static void *periodic_thread(void *arg);
 
 
 int main(int argc, char *argv[]){
+    
+    #if(USE_AESD_CHAR_DEVICE != 1)
     // Remove output file if already exist
     if ((remove(output_filename) == -1) && (errno != ENOENT)) { // MUST: What happens if 2 isntances of this program run
 		print_syscall_error("remove of file failed: %s", errno);
         goto ERROR;
 	}
-	
+    #endif
+    
 	// Enable logging
 	openlog("aesdsocket", LOG_PID, LOG_DAEMON);
 	
@@ -144,19 +153,15 @@ int main(int argc, char *argv[]){
         goto FAIL_SOCKET;
 	}
 
-    // open output file and save fd
-    output_fd = open(output_filename, O_CREAT | O_RDWR | O_APPEND, 0644);   // No need of mutex
-    if(output_fd == -1){
-        print_syscall_error("Error in opening output file: %s", errno);
-        goto FAIL_SOCKET;
-    }
 
+    #if(USE_AESD_CHAR_DEVICE != 1)
     // Create period task to log timestamp
     pthread_t timestamp_thread; 
     if(pthread_create(&(timestamp_thread), NULL, periodic_thread, NULL) != 0){
         print_syscall_error("Could not timestamp_log thread: %s", errno);
-        goto FAIL_OUTPUT_FILE;
-    }    
+        goto FAIL_SOCKET;
+    }   
+    #endif 
 
     // Initialize linked list to store threads
     SLIST_INIT(&head);  // MUST: Handle return values/errors of Linked List macros
@@ -198,6 +203,7 @@ int main(int argc, char *argv[]){
     
     clean_up_all_client_threads();
 
+    #if(USE_AESD_CHAR_DEVICE == 1)
     if(atomic_load(&periodic_task_error_exit_requested) == 0){
         // Exit not requested by thread
         // Otherwise it would have exited itself already
@@ -208,11 +214,7 @@ int main(int argc, char *argv[]){
     if(pthread_join(timestamp_thread, NULL) != 0){// Don't care about return value
         print_syscall_error("Could not join time_stamp thread: %s", errno);
     }
-
-    FAIL_OUTPUT_FILE:
-        if(close(output_fd) == -1){
-            print_syscall_error("output_fd close failed: %s", errno);
-        }
+    #endif
 
     FAIL_SOCKET:
         if(close(socket_fd) == -1){
@@ -274,8 +276,42 @@ static void *periodic_thread(void *arg)
                 "%s",
                 time_str);
 
-            // write to file
-            write_to_file(time_str, (ssize_t)(strlen(time_str)));
+            
+            // open output file and save fd
+            #if (USE_AESD_CHAR_DEVICE != 1)
+            int output_fd = open(output_filename, O_CREAT | O_RDWR | O_APPEND, 0644);   // No need of mutex
+            #else
+            int output_fd = open(output_filename, O_RDWR); //  Do not create,
+                                                        // created by load script
+                                                        //  append ignored,
+                                                        //      driver handles append
+                                                        //      so don't need
+            #endif
+            
+            if(output_fd == -1){
+                print_syscall_error("Error in opening output file in timestamp write: %s",
+                                    errno);
+                atomic_store(&periodic_task_error_exit_requested, true);
+                break;
+            }
+            
+            
+            // append to file
+            if(write_to_file(output_fd, time_str, (size_t)(strlen(time_str))) == -1){
+                print_syscall_error("Error in writing in timestamp write: %s",
+                        errno);
+                atomic_store(&periodic_task_error_exit_requested, true);
+                break;
+            }
+
+            
+            // close fd
+            if(close(output_fd) == -1){
+                print_syscall_error("Error in closing fd in timestamp write: %s",
+                                    errno);
+                atomic_store(&periodic_task_error_exit_requested, true);
+                break;
+            }
 
         }
         else {
@@ -416,9 +452,12 @@ static void *process_client(void *arg_client_node){
     ssize_t num_bytes_rcvd;
     ssize_t total_bytes_rcvd = 0;
     
+    int output_fd = -1;
+
     while(1){
         num_bytes_rcvd = recv(client_node->client_fd, buffer, sizeof(buffer), 0);
 
+        
         if(num_bytes_rcvd == 0){
             // connection closed
             goto CLOSE_CLIENT;
@@ -430,17 +469,32 @@ static void *process_client(void *arg_client_node){
         }
         
         // Received some bytes
-//         //---------Test Code------------
-// //			for (ssize_t i = 0; i < num_bytes_rcvd; i++) {
-// //				syslog(LOG_DEBUG, "buffer[%zd] = %d", i, (unsigned char)buffer[i]);
-// //			}	
-//         //---------Test Code------------
+        //         //---------Test Code------------
+        // //			for (ssize_t i = 0; i < num_bytes_rcvd; i++) {
+            // //				syslog(LOG_DEBUG, "buffer[%zd] = %d", i, (unsigned char)buffer[i]);
+            // //			}	
+            //         //---------Test Code------------
         
-        total_bytes_rcvd += num_bytes_rcvd;
-
-        // append to file
-        if(write_to_file(buffer, num_bytes_rcvd) == -1){
+        // open output file and save fd
+        #if (USE_AESD_CHAR_DEVICE != 1)
+        output_fd = open(output_filename, O_CREAT | O_RDWR | O_APPEND, 0644);   // No need of mutex
+        #else
+        output_fd = open(output_filename, O_RDWR); //  Do not create,
+                                                    // created by load script
+                                                    //  append ignored,
+                                                    //      driver handles append
+                                                    //      so don't need
+        #endif
+        
+        if(output_fd == -1){
+            print_syscall_error("Error in opening output file: %s", errno);
             goto CLOSE_CLIENT;
+        }
+        
+        
+        // append to file
+        if(write_to_file(output_fd, buffer, (size_t)num_bytes_rcvd) == -1){
+            goto CLOSE_FD;
         }
 
         if(buffer[num_bytes_rcvd - 1] == '\n'){
@@ -448,19 +502,30 @@ static void *process_client(void *arg_client_node){
             
             // Send to client
             // go to beginning of file
-             if(send_file_data_to_client(client_node->client_fd) == -1){
-                goto CLOSE_CLIENT;
-             }
+            if(send_file_data_to_client(output_fd, client_node->client_fd) == -1){
+                goto CLOSE_FD;
+            }
         }
+        
+        // close fd
+        if(close(output_fd) == -1){
+            print_syscall_error("output_fd close failed: %s", errno);
+            goto CLOSE_CLIENT;
+        }
+        total_bytes_rcvd += num_bytes_rcvd;
     }
 
-    CLOSE_CLIENT:
-        if(close(client_node->client_fd) == -1){
-            print_syscall_error("Close failed: %s", errno);
-        }
-        atomic_store(&(client_node->client_done), true);    // FUTURE: Create thread_status instead of 0/1
-                                                            // main will clean up node
-        return NULL;   
+CLOSE_FD:
+    if(close(output_fd) == -1){
+        print_syscall_error("output_fd close failed: %s", errno);
+    }   
+CLOSE_CLIENT:
+    if(close(client_node->client_fd) == -1){
+        print_syscall_error("Close failed: %s", errno);
+    }
+    atomic_store(&(client_node->client_done), true);    // FUTURE: Create thread_status instead of 0/1
+                                                        // main will clean up node
+    return NULL;   
     
 }
 
@@ -518,9 +583,9 @@ static void daemonize(void){    // MUST: Handle errors?
 
 
 // Uses output_fd
-static int write_to_file(char *buf, ssize_t num_bytes_to_write){
+static int write_to_file(int output_fd, char *buf, size_t num_bytes_to_write){
 	
-    ssize_t total_written = 0;
+    size_t total_written = 0;
 
 	while(total_written < num_bytes_to_write){
 
@@ -529,7 +594,7 @@ static int write_to_file(char *buf, ssize_t num_bytes_to_write){
         pthread_mutex_lock(&output_fd_mutex);
         num_bytes_written = write(output_fd, 
                 buf + total_written,
-                (size_t)num_bytes_to_write - total_written);
+                num_bytes_to_write - total_written);
         pthread_mutex_unlock(&output_fd_mutex);
 
 		if(num_bytes_written <= 0){
@@ -537,7 +602,7 @@ static int write_to_file(char *buf, ssize_t num_bytes_to_write){
             return -1;
 		}
 
-        total_written += num_bytes_written;
+        total_written += (size_t)num_bytes_written;
 	}	
 
     // all bytes written
@@ -547,17 +612,17 @@ static int write_to_file(char *buf, ssize_t num_bytes_to_write){
 
 
 // Uses output_fd, client_fd
-static int  send_file_data_to_client(int client_fd){
+static int  send_file_data_to_client(int output_fd, int client_fd){
+    #if (USE_AESD_CHAR_DEVICE != 1)
 	// Go to beginning of file
     pthread_mutex_lock(&output_fd_mutex);
 	off_t status = lseek(output_fd, 0, SEEK_SET);			
     pthread_mutex_unlock(&output_fd_mutex);
-
 	if(status == -1){
 		print_syscall_error("Error in file seek: %s", errno);
         return -1;
 	}
-
+    #endif
 
 	// write everything to send until all bytes sent
 	while(1){
