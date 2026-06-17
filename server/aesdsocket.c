@@ -55,7 +55,7 @@ SLIST_HEAD(node_head, node);
 
 struct node_head head;
 
-#if(USE_AESD_CHAR_DEVICE == 1)
+#if(USE_AESD_CHAR_DEVICE != 1)
 static const char output_filename[] = "/var/tmp/aesdsocketdata";
 #else
 static const char output_filename[] = "/dev/aesdchar";
@@ -85,9 +85,10 @@ static int setup_signal_handlers(void);
 
 static void print_syscall_error(char *error_msg, int error_number);
 
+#if(USE_AESD_CHAR_DEVICE != 1)
 static void timestamp_thread_wake_handler(int signo);
 static void *periodic_thread(void *arg);
-
+#endif
 
 int main(int argc, char *argv[]){
     
@@ -203,7 +204,7 @@ int main(int argc, char *argv[]){
     
     clean_up_all_client_threads();
 
-    #if(USE_AESD_CHAR_DEVICE == 1)
+    #if(USE_AESD_CHAR_DEVICE != 1)
     if(atomic_load(&periodic_task_error_exit_requested) == 0){
         // Exit not requested by thread
         // Otherwise it would have exited itself already
@@ -225,13 +226,14 @@ int main(int argc, char *argv[]){
 
 }
 
-
+#if(USE_AESD_CHAR_DEVICE != 1)
 static void timestamp_thread_wake_handler(int signo)
 {
     (void)signo;
     // Do nothing, just want to wake up thread from sleep
     // to allow exit gracefully
 }
+
 
 static void *periodic_thread(void *arg)
 {
@@ -348,7 +350,7 @@ static void *periodic_thread(void *arg)
 
     return NULL;
 }
-
+#endif
 
 static void clean_up_closed_client_threads(void){ // MUST: Handle all syslogs at process level???
     syslog(LOG_DEBUG, "Cleaning up closed client threads");
@@ -685,14 +687,18 @@ static int setup_signal_handlers(void){    // MUST: Use the setting flag and cat
                                             // errors
 	struct sigaction sa;
 	
+	#if(USE_AESD_CHAR_DEVICE != 1)
     // timestamp thread signal handler
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = timestamp_thread_wake_handler;
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = 0;
 
-    sigaction(SIGUSR1, &sa, NULL);
-
+	if(sigaction(SIGUSR1, &sa, NULL) == -1){
+		print_syscall_error("Error in setting up SIGUSR1 sigaction: %s", errno);
+        return -1;
+	}
+	#endif
 
     // global signal handlers
 	memset(&sa, 0, sizeof(sa));
