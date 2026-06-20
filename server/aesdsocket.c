@@ -90,6 +90,14 @@ static void timestamp_thread_wake_handler(int signo);
 static void *periodic_thread(void *arg);
 #endif
 
+
+#if (USE_AESD_CHAR_DEVICE == 1) // Debug message
+#warning "AESD SOCKET BUILDING WITH CHAR DEVICE MODE"
+#else
+#warning "AESD SOCKET BUILDING WITH FILE/TIMESTAMP MODE"
+#endif
+
+
 int main(int argc, char *argv[]){
     
     #if(USE_AESD_CHAR_DEVICE != 1)
