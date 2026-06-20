@@ -8,7 +8,7 @@ all: aesdsocket
 
 USE_AESD_CHAR_DEVICE ?= 1
 
-CFLAGS += -DUSE_AESD_CHAR_DEVICE=$(USE_AESD_CHAR_DEVICE)
+override CFLAGS += -DUSE_AESD_CHAR_DEVICE=$(USE_AESD_CHAR_DEVICE)
 
 aesdsocket: aesdsocket.c
 	$(CC) $(CFLAGS) $(LDFLAGS) ./aesdsocket.c -o ./aesdsocket
