@@ -2,7 +2,7 @@
 
 CC ?= $(CROSS_COMPILE)gcc
 # CFLAGS ?= -Wall -Wextra -Wconversion -Wsign-conversion -Werror -pthread
-CFLAGS ?= -g -O0 -Wall -Wextra -Wconversion -Wsign-conversion -Werror -pthread 
+CFLAGS ?= -g -O0 -Wall -Wextra -Wconversion -Wsign-conversion -Werror -pthread -I../aesd-char-driver
 LDFLAGS ?=
 all: aesdsocket
 
