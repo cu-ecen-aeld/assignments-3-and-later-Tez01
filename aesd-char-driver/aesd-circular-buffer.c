@@ -86,21 +86,26 @@ void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer,
     * TODO: implement per description
     */
     
-    buffer->entry[buffer->in_offs] = *add_entry;
-    buffer->in_offs++;
-    if(buffer->in_offs >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED){
-        // roll over
-        buffer->in_offs = 0;
-    }
-
     if(buffer->full == true){ 
+        // remove oldest entry
+        
+        buffer->cur_size -= (buffer->entry)[buffer->out_offs].size;
         buffer->out_offs++;
         if(buffer->out_offs >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED){
             // roll over
             buffer->out_offs = 0;
         }
     }
-    
+
+    // add new entry
+    buffer->entry[buffer->in_offs] = *add_entry;
+    buffer->cur_size += add_entry->size;
+    buffer->in_offs++;
+    if(buffer->in_offs >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED){
+        // roll over
+        buffer->in_offs = 0;
+    }
+
     if(buffer->in_offs == buffer->out_offs){
         buffer->full = true;
     }
