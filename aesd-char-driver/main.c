@@ -256,6 +256,8 @@ static long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
         
         struct aesd_circular_buffer *buf = &(dev->circular_buffer);
 
+        PDEBUG("aesd_ioctl entered: cmd=%u\n", cmd);
+
         // check if cmd is within range
         uint16_t num_cmds;
         
@@ -281,16 +283,18 @@ static long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
             num_cmds = 0;
         }
 
+        PDEBUG("Going to check cmd within range");
         if(seekto.cmd > (num_cmds - 1)){
             return_code = -EINVAL;
             goto EXIT_FUNCTION;
         }
-        
+        PDEBUG("Cmd within range");
+
         // cmd within range
         // check if offset within cmd is within range
-        uint16_t absolute_offset;
+        uint16_t absolute_cmd;
         if(buf->in_offs > buf->out_offs){
-            absolute_offset = buf->in_offs + seekto.cmd;
+            absolute_cmd = buf->out_offs + seekto.cmd;
         }
         else{
             // check if gonna wrap
@@ -298,18 +302,22 @@ static long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
             uint16_t remaining = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED - buf->out_offs;
             if(remaining - 1 >= seekto.cmd ){
                 // not gonna wrap
-                absolute_offset = buf->in_offs + seekto.cmd;
+                absolute_cmd = buf->out_offs + seekto.cmd;
             }
             else{
                 // gonna wrap
-                absolute_offset = seekto.cmd - remaining;
+                absolute_cmd = seekto.cmd - remaining;
             }
         }
 
-        if(absolute_offset >= buf->entry[absolute_offset].size){
+        PDEBUG("Going to check offset_within_cmd within range. absolute_cmd=%u\n", 
+                (unsigned int)absolute_cmd);
+
+        if(seekto.offset_within_cmd >= buf->entry[absolute_cmd].size){
             return_code = -EINVAL;
             goto EXIT_FUNCTION;
         }
+        PDEBUG("offset_within_cmd in range.\nGonna update offset.");
 
         // offset within range
         // update f_pos
@@ -318,7 +326,7 @@ static long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
         uint16_t entry_index = buf->out_offs;
 
         while(1){
-            if(entry_index == absolute_offset){
+            if(entry_index == absolute_cmd){
                 break;
             }
 
@@ -328,6 +336,8 @@ static long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
                 entry_index = 0;
             }
         }
+
+        PDEBUG("Updated offset: offset=%u\n", (unsigned int)offset);
 
         offset += seekto.offset_within_cmd;
         filp->f_pos = offset;

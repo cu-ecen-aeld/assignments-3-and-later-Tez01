@@ -962,18 +962,6 @@ static void *process_client(void *arg_client_node){
 
         // Received some bytes
 
-        //         //---------Test Code------------
-
-        // //			for (ssize_t i = 0; i < num_bytes_rcvd; i++) {
-
-            // //				syslog(LOG_DEBUG, "buffer[%zd] = %d", i, (unsigned char)buffer[i]);
-
-            // //			}	
-
-            //         //---------Test Code------------
-
-        
-
         // open output file and save fd
 
         #if (USE_AESD_CHAR_DEVICE != 1)
@@ -1041,19 +1029,25 @@ static void *process_client(void *arg_client_node){
             buffer[consumed + 1] == '\0';
 
 
-
+        syslog(LOG_DEBUG, "Going to check for ioctl cmd");
         if (valid == 1) {
 
             // ioctl cmd
-
+            syslog(LOG_DEBUG, "Ioctl cmd");
             // do ioctl operation
 
-            if(ioctl(output_fd, AESDCHAR_IOCSEEKTO, &seekto) == -1){
 
+            int ioctl_ret = ioctl(output_fd, AESDCHAR_IOCSEEKTO, &seekto);
+
+            syslog(LOG_DEBUG,
+                "ioctl returned %d, errno=%d (%s)",
+                ioctl_ret,
+                errno,
+                strerror(errno));
+
+            if (ioctl_ret == -1) {
                 goto CLOSE_FD;
-
             }
-
             
 
             // Send all file data to client
@@ -1069,6 +1063,7 @@ static void *process_client(void *arg_client_node){
         else{
 
             // not ioctl cmd
+            syslog(LOG_DEBUG, "Not Ioctl cmd");
 
             // append to file
 
@@ -1084,15 +1079,40 @@ static void *process_client(void *arg_client_node){
 
                 // packet complete
 
-                
-
                 // Send all file data to client
 
+                // Go to beginning of file
+                pthread_mutex_lock(&output_fd_mutex);
+
+                off_t status = lseek(output_fd, 0, SEEK_SET);			
+
+                pthread_mutex_unlock(&output_fd_mutex);
+
+                if(status == -1){
+
+                    print_syscall_error("Error in file seek: %s", errno);
+
+                    goto CLOSE_FD;
+
+                }
+                
                 if(send_file_data_to_client(output_fd, client_node->client_fd) == -1){
 
                     goto CLOSE_FD;
 
                 }
+
+
+                //         //---------Test Code------------
+
+                for (ssize_t i = 0; i < num_bytes_rcvd; i++) {
+
+                    syslog(LOG_DEBUG, "Going to write buffer[%zd] = %d", i, (unsigned char)buffer[i]);
+
+                }	
+
+                //         //---------Test Code------------
+
 
             }
 
@@ -1314,29 +1334,7 @@ static int write_to_file(int output_fd, char *buf, size_t num_bytes_to_write){
 
 static int  send_file_data_to_client(int output_fd, int client_fd){
 
-    #if (USE_AESD_CHAR_DEVICE != 1)
-
-	// Go to beginning of file
-
-    pthread_mutex_lock(&output_fd_mutex);
-
-	off_t status = lseek(output_fd, 0, SEEK_SET);			
-
-    pthread_mutex_unlock(&output_fd_mutex);
-
-	if(status == -1){
-
-		print_syscall_error("Error in file seek: %s", errno);
-
-        return -1;
-
-	}
-
-    #endif
-
-
-
-	// write everything to send until all bytes sent
+    // write everything to send until all bytes sent
 
 	while(1){
 
